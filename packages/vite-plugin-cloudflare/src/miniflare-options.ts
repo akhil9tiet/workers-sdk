@@ -141,6 +141,23 @@ function createRemoteBindingsLogger(logger: vite.Logger): RemoteBindingsLogger {
 	};
 }
 
+/**
+ * Reduces a module-invoke error to a serializable object so it can cross the
+ * miniflare fetcher boundary. Copied from
+ * `./workers/runner-worker/errors.ts` (itself copied from
+ * `packages/wrangler/templates/middleware/middleware-miniflare3-json-error.ts`).
+ */
+function reduceInvokeError(e: unknown): unknown {
+	const errorObj = (e ?? {}) as Record<string, unknown>;
+	return {
+		name: errorObj.name,
+		message: errorObj.message ?? String(e),
+		stack: errorObj.stack,
+		cause:
+			errorObj.cause === undefined ? undefined : reduceInvokeError(errorObj.cause),
+	};
+}
+
 export async function getDevMiniflareOptions(
 	ctx: AssetsOnlyPluginContext | WorkersPluginContext,
 	viteDevServer: vite.ViteDevServer
@@ -345,203 +362,219 @@ export async function getDevMiniflareOptions(
 	const workersFromConfig =
 		resolvedPluginConfig.type === "workers"
 			? await Promise.all(
-					[...resolvedPluginConfig.environmentNameToWorkerMap].map(
-						async ([environmentName, worker]) => {
-							const bindings =
-								wrangler.unstable_convertConfigBindingsToStartWorkerBindings(
-									worker.config
+						[...resolvedPluginConfig.environmentNameToWorkerMap].map(
+							async ([environmentName, worker]) => {
+								const bindings =
+									wrangler.unstable_convertConfigBindingsToStartWorkerBindings(
+										worker.config
+									);
+
+								const preExistingRemoteProxySession = worker.config.configPath
+									? remoteProxySessionsDataMap.get(worker.config.configPath)
+									: undefined;
+
+								const remoteProxySessionData =
+									!resolvedPluginConfig.remoteBindings
+										? // if remote bindings are not enabled then the proxy session can simply be null
+												null
+										: await maybeStartOrUpdateRemoteProxySession(
+												{
+													name: worker.config.name,
+													bindings: bindings ?? {},
+													complianceRegion: worker.config.compliance_region,
+													account_id: worker.config.account_id,
+													profileDir: resolvedViteConfig.root,
+												},
+												preExistingRemoteProxySession ?? null,
+												undefined,
+												{
+													cliDisplayName: resolvedPluginConfig.cliDisplayName,
+													logger: createRemoteBindingsLogger(
+														viteDevServer.config.logger
+													),
+												}
+											);
+
+								if (worker.config.configPath && remoteProxySessionData) {
+									remoteProxySessionsDataMap.set(
+										worker.config.configPath,
+										remoteProxySessionData
+									);
+								}
+
+								let containerBuildId: string | undefined;
+								if (
+									worker.config.containers?.length &&
+									worker.config.dev.enable_containers
+								) {
+									const dockerPath = getDockerPath();
+									containerEngine = resolveDockerHost(dockerPath);
+									containerBuildId = generateContainerBuildId();
+									containerOptionsByWorker.set(
+										worker.config,
+										createContainerDevPlan({
+											containers: worker.config.containers,
+											exports: worker.config.exports,
+											containerBuildId,
+											configPath: worker.config.configPath,
+										})?.containerOptions ?? []
+									);
+								}
+								const miniflareWorkerOptions =
+									wrangler.unstable_getMiniflareWorkerOptions(
+										{
+											...worker.config,
+											assets: undefined,
+										},
+										resolvedPluginConfig.cloudflareEnv,
+										{
+											remoteProxyConnectionString:
+												remoteProxySessionData?.session
+													?.remoteProxyConnectionString,
+
+											containerBuildId,
+										}
+									);
+
+								const { externalWorkers } = miniflareWorkerOptions;
+								const workerOptions =
+									miniflareWorkerOptions.workerOptions as V4WorkerOptions;
+
+								if (
+									workerOptions.browserRendering &&
+									getBrowserRenderingHeadfulFromEnv()
+								) {
+									workerOptions.browserRendering.headful = true;
+								}
+
+								const wrappers = [
+									`import { createWorkerEntrypointWrapper, createDurableObjectWrapper, createWorkflowEntrypointWrapper } from "${RUNNER_PATH}";`,
+									`export { __VITE_RUNNER_OBJECT__ } from "${RUNNER_PATH}";`,
+									`export default createWorkerEntrypointWrapper("default");`,
+								];
+
+								const exportTypes = ctx.workerNameToExportTypesMap.get(
+									worker.config.name
 								);
+								assert(exportTypes, `Expected exportTypes to be defined`);
 
-							const preExistingRemoteProxySession = worker.config.configPath
-								? remoteProxySessionsDataMap.get(worker.config.configPath)
-								: undefined;
+								for (const [name, type] of Object.entries(exportTypes)) {
+									wrappers.push(
+										`export const ${name} = create${type}Wrapper("${name}");`
+									);
+								}
 
-							const remoteProxySessionData =
-								!resolvedPluginConfig.remoteBindings
-									? // if remote bindings are not enabled then the proxy session can simply be null
-										null
-									: await maybeStartOrUpdateRemoteProxySession(
+								return {
+									externalWorkers,
+									worker: {
+										...workerOptions,
+										name: worker.config.name,
+										modulesRoot: miniflareModulesRoot,
+										modules: [
 											{
-												name: worker.config.name,
-												bindings: bindings ?? {},
-												complianceRegion: worker.config.compliance_region,
-												account_id: worker.config.account_id,
-												profileDir: resolvedViteConfig.root,
+												type: "ESModule",
+												path: path.join(miniflareModulesRoot, WRAPPER_PATH),
+												contents: wrappers.join("\n"),
 											},
-											preExistingRemoteProxySession ?? null,
-											undefined,
 											{
-												cliDisplayName: resolvedPluginConfig.cliDisplayName,
-												logger: createRemoteBindingsLogger(
-													viteDevServer.config.logger
+												type: "ESModule",
+												path: path.join(miniflareModulesRoot, RUNNER_PATH),
+												contents: fs.readFileSync(
+													fileURLToPath(new URL(RUNNER_PATH, import.meta.url))
 												),
-											}
-										);
-
-							if (worker.config.configPath && remoteProxySessionData) {
-								remoteProxySessionsDataMap.set(
-									worker.config.configPath,
-									remoteProxySessionData
-								);
-							}
-
-							let containerBuildId: string | undefined;
-							if (
-								worker.config.containers?.length &&
-								worker.config.dev.enable_containers
-							) {
-								const dockerPath = getDockerPath();
-								containerEngine = resolveDockerHost(dockerPath);
-								containerBuildId = generateContainerBuildId();
-								containerOptionsByWorker.set(
-									worker.config,
-									createContainerDevPlan({
-										containers: worker.config.containers,
-										exports: worker.config.exports,
-										containerBuildId,
-										configPath: worker.config.configPath,
-									})?.containerOptions ?? []
-								);
-							}
-							const miniflareWorkerOptions =
-								wrangler.unstable_getMiniflareWorkerOptions(
-									{
-										...worker.config,
-										assets: undefined,
-									},
-									resolvedPluginConfig.cloudflareEnv,
-									{
-										remoteProxyConnectionString:
-											remoteProxySessionData?.session
-												?.remoteProxyConnectionString,
-
-										containerBuildId,
-									}
-								);
-
-							const { externalWorkers } = miniflareWorkerOptions;
-							const workerOptions =
-								miniflareWorkerOptions.workerOptions as V4WorkerOptions;
-
-							if (
-								workerOptions.browserRendering &&
-								getBrowserRenderingHeadfulFromEnv()
-							) {
-								workerOptions.browserRendering.headful = true;
-							}
-
-							const wrappers = [
-								`import { createWorkerEntrypointWrapper, createDurableObjectWrapper, createWorkflowEntrypointWrapper } from "${RUNNER_PATH}";`,
-								`export { __VITE_RUNNER_OBJECT__ } from "${RUNNER_PATH}";`,
-								`export default createWorkerEntrypointWrapper("default");`,
-							];
-
-							const exportTypes = ctx.workerNameToExportTypesMap.get(
-								worker.config.name
-							);
-							assert(exportTypes, `Expected exportTypes to be defined`);
-
-							for (const [name, type] of Object.entries(exportTypes)) {
-								wrappers.push(
-									`export const ${name} = create${type}Wrapper("${name}");`
-								);
-							}
-
-							return {
-								externalWorkers,
-								worker: {
-									...workerOptions,
-									name: worker.config.name,
-									modulesRoot: miniflareModulesRoot,
-									modules: [
-										{
-											type: "ESModule",
-											path: path.join(miniflareModulesRoot, WRAPPER_PATH),
-											contents: wrappers.join("\n"),
-										},
-										{
-											type: "ESModule",
-											path: path.join(miniflareModulesRoot, RUNNER_PATH),
-											contents: fs.readFileSync(
-												fileURLToPath(new URL(RUNNER_PATH, import.meta.url))
-											),
-										},
-										// A breaking change to the module runner was introduced in
-										// https://github.com/vitejs/vite/pull/20924 and released in Vite 7.2.0.
-										// We ship two bundled copies of vite/module-runner and select the
-										// appropriate one based on the user's installed Vite version.
-										{
-											type: "ESModule",
-											path: path.join(
-												miniflareModulesRoot,
-												"workers/runner-worker/vite/module-runner"
-											),
-											contents: fs.readFileSync(
-												fileURLToPath(
-													new URL(
-														satisfiesMinimumViteVersion("7.2.0")
-															? MODULE_RUNNER_PATH
-															: MODULE_RUNNER_LEGACY_PATH,
-														import.meta.url
+											},
+											// A breaking change to the module runner was introduced in
+											// https://github.com/vitejs/vite/pull/20924 and released in Vite 7.2.0.
+											// We ship two bundled copies of vite/module-runner and select the
+											// appropriate one based on the user's installed Vite version.
+											{
+												type: "ESModule",
+												path: path.join(
+													miniflareModulesRoot,
+													"workers/runner-worker/vite/module-runner"
+												),
+												contents: fs.readFileSync(
+													fileURLToPath(
+														new URL(
+															satisfiesMinimumViteVersion("7.2.0")
+																? MODULE_RUNNER_PATH
+																: MODULE_RUNNER_LEGACY_PATH,
+															import.meta.url
+														)
 													)
-												)
-											),
-										},
-									],
-									unsafeUseModuleFallbackService: true,
-									unsafeInspectorProxy: inputInspectorPort !== false,
-									// Route dev registry requests through the vite Assets proxy worker,
-									...(environmentName ===
-										resolvedPluginConfig.entryWorkerEnvironmentName && {
-										unsafeOverrideFetchWorker: VITE_PROXY_WORKER_NAME,
-									}),
-									unsafeEvalBinding: "__VITE_UNSAFE_EVAL__",
-									serviceBindings: {
-										...workerOptions.serviceBindings,
+												),
+											},
+										],
+										unsafeUseModuleFallbackService: true,
+										unsafeInspectorProxy: inputInspectorPort !== false,
+										// Route dev registry requests through the vite Assets proxy worker,
 										...(environmentName ===
-											resolvedPluginConfig.entryWorkerEnvironmentName &&
-										worker.config.assets?.binding
-											? {
-													[worker.config.assets.binding]: {
-														node: (req, res) => {
+											resolvedPluginConfig.entryWorkerEnvironmentName && {
+											unsafeOverrideFetchWorker: VITE_PROXY_WORKER_NAME,
+										}),
+										unsafeEvalBinding: "__VITE_UNSAFE_EVAL__",
+										serviceBindings: {
+											...workerOptions.serviceBindings,
+											...(environmentName ===
+												resolvedPluginConfig.entryWorkerEnvironmentName &&
+											worker.config.assets?.binding
+												? {
+														[worker.config.assets.binding]: {
+															node: (req, res) => {
 															req[kRequestType] = "asset";
 															viteDevServer.middlewares(req, res);
 														},
 													},
 												}
-											: {}),
-										__VITE_INVOKE_MODULE__: async (request) => {
-											const targetEnvironmentName = request.headers.get(
-												ENVIRONMENT_NAME_HEADER
-											);
-											assert(
-												targetEnvironmentName,
-												`Expected ${ENVIRONMENT_NAME_HEADER} header`
-											);
-											const payload =
-												(await request.json()) as vite.CustomPayload;
-											const devEnvironment = viteDevServer.environments[
-												targetEnvironmentName
-											] as CloudflareDevEnvironment;
-											const result =
-												await devEnvironment.hot.handleInvoke(payload);
-											return MiniflareResponse.json(result);
+												: {}),
+											__VITE_INVOKE_MODULE__: async (request) => {
+												const targetEnvironmentName = request.headers.get(
+													ENVIRONMENT_NAME_HEADER
+												);
+												assert(
+													targetEnvironmentName,
+													`Expected ${ENVIRONMENT_NAME_HEADER} header`
+												);
+												const payload =
+													(await request.json()) as vite.CustomPayload;
+												const devEnvironment = viteDevServer.environments[
+													targetEnvironmentName
+												] as CloudflareDevEnvironment;
+												const result =
+													await devEnvironment.hot.handleInvoke(payload);
+												try {
+													return MiniflareResponse.json(result);
+												} catch {
+													// `handleInvoke()` may return a module error carrying extra,
+													// non-serializable fields (e.g. circular references copied onto the
+													// error by vite's `handleInvoke`). Reduce it to its serializable parts
+													// instead so the module runner receives the real error rather than a
+													// 500 whose body is the JSON `TypeError` text
+													// (cloudflare/workers-sdk#16339).
+													const errorPayload =
+														result !== null &&
+													typeof result === "object" &&
+													"error" in result
+														? { error: reduceInvokeError((result as { error: unknown }).error) }
+														: { error: reduceInvokeError(result) };
+													return MiniflareResponse.json(errorPayload, { status: 500 });
+												}
+											},
 										},
-									},
-									durableObjects: {
-										...workerOptions.durableObjects,
-										__VITE_RUNNER_OBJECT__: {
-											className: "__VITE_RUNNER_OBJECT__",
-											unsafeUniqueKey: kUnsafeEphemeralUniqueKey,
-											unsafePreventEviction: true,
+										durableObjects: {
+											...workerOptions.durableObjects,
+											__VITE_RUNNER_OBJECT__: {
+												className: "__VITE_RUNNER_OBJECT__",
+												unsafeUniqueKey: kUnsafeEphemeralUniqueKey,
+												unsafePreventEviction: true,
+											},
 										},
-									},
-								} satisfies V4WorkerOptions,
-							};
-						}
+									} satisfies V4WorkerOptions,
+								};
+							}
+						)
 					)
-				)
-			: [];
+				: [];
 
 	const userWorkers = workersFromConfig.map((options) => options.worker);
 
@@ -780,7 +813,7 @@ export async function getPreviewMiniflareOptions(
 
 				const remoteProxySessionData = !resolvedPluginConfig.remoteBindings
 					? // if remote bindings are not enabled then the proxy session can simply be null
-						null
+							null
 					: await maybeStartOrUpdateRemoteProxySession(
 							{
 								name: workerConfig.name,
@@ -796,7 +829,7 @@ export async function getPreviewMiniflareOptions(
 								logger: createRemoteBindingsLogger(
 									vitePreviewServer.config.logger
 								),
-							}
+							},
 						);
 
 				if (workerConfig.configPath && remoteProxySessionData) {
